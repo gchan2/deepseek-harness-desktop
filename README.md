@@ -1,6 +1,6 @@
 # DeepSeek Harness Desktop
 
-把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）打包成原生 macOS 应用：双击启动后自动拉起本地 `dsh web` 服务，并用原生窗口加载它的 Web UI。
+把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）打包成 macOS 应用：双击启动后自动拉起本地 `dsh web` 服务，并在系统默认浏览器中打开它的 Web UI（macOS 12 兼容模式）。
 
 ![运行截图](docs/screenshot.png)
 
@@ -8,8 +8,8 @@
 
 ## ✨ 特性
 
-- **原生 macOS 应用**：Swift + AppKit + WKWebView，不是 Electron 壳。
-- **一键启动**：双击图标 → 自动定位 Node → 拉起 `dsh web`（默认 `127.0.0.1:3080`）→ 窗口内加载。
+- **一键启动**：双击图标 → 自动定位 Node → 拉起 `dsh web`（默认 `127.0.0.1:3080`）→ 在系统默认浏览器中打开 dsh。
+- **macOS 12 兼容模式**：macOS 12 的 WKWebView（Safari 15 引擎）缺正则 lookbehind 等现代特性，无法渲染 dsh 前端，因此本应用自动改用系统默认浏览器（Safari 13+ / Firefox / Chrome 等）打开 dsh。
 - **优雅退出**：关闭窗口时自动向子进程发送 `SIGTERM`，让 dsh 干净收尾。
 - **自定义图标**：鲸鱼剪影 + DeepSeek 蓝渐变，随源码一起生成。
 - **内置运行时**：`@deepseek-ai/dsh` 及全部依赖被打进 `.app`，离线可用。
@@ -21,6 +21,7 @@
 | macOS | ≥ 12.0 | `LSMinimumSystemVersion` |
 | Xcode Command Line Tools | 任意 | 提供 `swiftc` |
 | Node.js | **≥ 20.12** | dsh 依赖 `util.parseEnv`，低版本会报 `SyntaxError` |
+| 系统默认浏览器 | Safari 16.4+ / Firefox / Chrome 等 | macOS 12 兼容模式需要浏览器支持正则 lookbehind |
 
 > 应用启动时会自动在 `/usr/local/bin`、`/opt/homebrew/bin` 等处探测可用的 Node，并校验版本 ≥ 20.12。
 
@@ -36,7 +37,7 @@ cd deepseek-harness-desktop
 ./build.sh --install
 ```
 
-构建完成后应用会出现在「应用程序」（`/Applications/DeepSeekHarness.app`）。
+构建完成后应用会出现在「应用程序」（`/Applications/DeepSeekHarness.app`）。双击运行：app 拉起后台服务并在浏览器中打开 dsh；窗口会显示一个提示页，可重新打开浏览器或退出服务。
 
 ### 方式二：只构建、不安装
 
@@ -55,10 +56,12 @@ DeepSeekHarness.app
 ├─ spawn: node bin-wrapper.mjs web
 │    └─ 动态 import @deepseek-ai/dsh/lib/bin.js（"web" profile）
 ├─ 轮询 127.0.0.1:3080 直到端口就绪
-└─ WKWebView 加载 http://127.0.0.1:3080
+├─ NSWorkspace.open(http://127.0.0.1:3080)
+│    └─ 用系统默认浏览器（macOS 12 兼容模式）打开 dsh Web UI
+└─ 窗口显示提示页：「已在浏览器中打开」+ 重新打开 / 退出按钮
 ```
 
-退出时（关窗口 / ⌘Q）→ `SIGTERM` → dsh 触发自身 shutdown → 子进程结束。
+退出时（关窗口 / ⌘Q / 点击提示页里的退出）→ `SIGTERM` → dsh 触发自身 shutdown → 子进程结束。
 
 ## 🧩 目录结构
 
@@ -66,10 +69,11 @@ DeepSeekHarness.app
 .
 ├── build.sh              # 一键构建脚本（自举：装依赖 → 编译 → 出图 → 打包 → 签名）
 ├── src/
-│   ├── main.swift        # 原生壳：进程管理 + WKWebView + 菜单
+│   ├── main.swift        # 原生壳：进程管理 + WKWebView 提示页 + 浏览器唤起
 │   └── makeicon.swift    # 用 CoreGraphics/NSBezierPath 绘制鲸鱼图标
 ├── dsh/
 │   ├── package.json      # 声明 @deepseek-ai/dsh 依赖
+│   ├── package-lock.json
 │   └── bin-wrapper.mjs   # 信号安全启动器（见下方「技术细节」）
 ├── docs/screenshot.png   # README 截图
 └── LICENSE
@@ -83,6 +87,10 @@ DeepSeekHarness.app
 
 3. **dsh 的 SIGINT 自杀行为**：`@deepseek-ai/dsh/lib/profile-boot-*.js` 注册了
    `process.on("SIGINT", () => interrupt(130))`——一旦子进程收到 SIGINT（终端/进程组残留信号），就会主动 `exit(130)`。`bin-wrapper.mjs` 通过 monkey-patch `process.on` / `process.addListener` 把 SIGINT / SIGHUP 的注册回调丢弃（只保留一个空监听器防止 Node 默认退出），但**保留 SIGTERM**，让 GUI 主动退出时 dsh 仍能干净清理。
+
+4. **macOS 12 的 WKWebView 不支持正则 lookbehind**：dsh 前端用 shiki 做代码高亮，TextMate 语法里有数百处 `(?<=...)` / `(?<!...)`（vendor 包里 719 处），而 Safari 15 不支持 lookbehind（Safari 16.4+ 才有），导致 `SyntaxError: Invalid regular expression: invalid group specifier name` 把 `conversation.chat.node` slot 渲染搞挂，用户看到的是「发了提问没回复」（后端 LLM 实际正常在流式输出，事件被前端丢失）。正则语法无法 polyfill，因此改用系统默认浏览器（Firefox / Safari 16.4+ / Chrome）渲染 dsh 即可正常。同时给 WKWebView 注入 console 桥接脚本，把 `AbortSignal.timeout/any`（Safari 16 / 17.4+ 才有的 API）补 polyfill，这样提示页的 WKWebView 也不会额外报这些错。
+
+5. **ATS web content 例外**：`ws://` 本地连接在 WKWebView 里仅靠 `NSAllowsLocalNetworking` 仍被 ATS 拦截，会导致 dsh 的事件流 WebSocket 一直 connection lost。本项目把 WKWebView 仅用于显示提示页（不连 dsh），但仍加上 `NSAllowsArbitraryLoadsInWebContent=true` 以防万一。
 
 ## 📄 许可证
 

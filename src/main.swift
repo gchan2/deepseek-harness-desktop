@@ -402,9 +402,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func finishLoading() {
         guard !didLoad else { return }
         didLoad = true
-        statusLabel.stringValue = "Connecting…"
-        let req = URLRequest(url: localURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
-        webView.load(req)
+        loadingContainer.isHidden = true
+        // Open the web UI in the system default browser (macOS 12 WKWebView
+        // lacks regex lookbehind, so the dsh front-end cannot render there).
+        NSWorkspace.shared.open(localURL)
+        let html = """
+        <html><head><meta charset="utf-8"><style>
+          body { font-family:-apple-system; display:flex; align-items:center; justify-content:center; height:100%; margin:0; background:#f5f5f7; }
+          .box { text-align:center; color:#1d1d1f; max-width:520px; padding:24px; }
+          h1 { font-size:22px; margin-bottom:12px; }
+          p { color:#555; line-height:1.6; }
+          .url { font-family:ui-monospace,monospace; font-size:13px; color:#888; }
+          a.btn { display:inline-block; margin:8px 4px; padding:10px 18px; border-radius:8px; background:#4A73FF; color:#fff; text-decoration:none; font-weight:600; }
+          a.btn.ghost { background:#e5e5ea; color:#1d1d1f; }
+        </style></head><body>
+        <div class="box">
+          <h1>已在浏览器中打开</h1>
+          <p>DeepSeek Harness 已在默认浏览器打开<br><span class="url">http://127.0.0.1:3080</span></p>
+          <p>本窗口负责在后台运行服务。<br><strong>关闭窗口或退出 App 会同时停止服务。</strong></p>
+          <p>
+            <a class="btn" href="http://127.0.0.1:3080">重新在浏览器打开</a>
+            <a class="btn ghost" href="app://quit">退出并停止服务</a>
+          </p>
+        </div></body></html>
+        """
+        webView.loadHTMLString(html, baseURL: nil)
     }
 
     private func showError(_ message: String) {
@@ -436,6 +458,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel); return
+        }
+        if url.scheme == "app" {
+            if url.host == "quit" {
+                NSApp.terminate(nil)
+            }
             decisionHandler(.cancel); return
         }
         // Keep everything on the local server inside the app; external links open in the browser.
