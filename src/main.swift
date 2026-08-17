@@ -6,7 +6,7 @@ import Darwin
 
 let port: UInt16 = 3080
 let localURL = URL(string: "http://127.0.0.1:\(port)")!
-let appName = "DeepSeek Harness"
+let appName = "dsh"
 let chromeWindowSize = "960,680"
 
 // MARK: - Helpers
@@ -181,7 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.image?.isTemplate = true
         }
         let menu = NSMenu()
-        let openItem = NSMenuItem(title: "打开 DeepSeek Harness", action: #selector(openWebUI), keyEquivalent: "o")
+        let openItem = NSMenuItem(title: "打开 dsh", action: #selector(openWebUI), keyEquivalent: "o")
         openItem.target = self
         menu.addItem(openItem)
         let browserItem = NSMenuItem(title: "在浏览器中打开", action: #selector(openInBrowserAction), keyEquivalent: "")
@@ -223,7 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSLog("DSH: launchServer: node=\(node)")
         guard let bin = bundledDSHBin() else {
-            notifyError("未找到内置的 DeepSeek Harness 程序，请重新安装本应用。")
+            notifyError("未找到内置的 dsh 程序，请重新安装本应用。")
             return
         }
         NSLog("DSH: launchServer: bin=\(bin)")

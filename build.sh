@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-APP_NAME="DeepSeekHarness"
-DISPLAY_NAME="DeepSeek Harness"
-BUNDLE_ID="com.deepseek.harness"
+APP_NAME="dsh"
+DISPLAY_NAME="dsh"
+BUNDLE_ID="com.deepseek.dsh"
 VERSION="0.1.0"
 BUILD="1"
 APP_DIR="$ROOT/$APP_NAME.app"
