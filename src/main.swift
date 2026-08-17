@@ -235,6 +235,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let ucc = WKUserContentController()
         let consoleBridge = """
         (function(){
+          // Polyfill AbortSignal.timeout / AbortSignal.any (Safari 16 / 17.4+);
+          // macOS 12 WKWebView (Safari 15) lacks them and dsh calls them directly.
+          try {
+            if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout !== 'function') {
+              AbortSignal.timeout = function(ms){
+                var c = new AbortController();
+                var t = setTimeout(function(){
+                  var reason;
+                  try { reason = new DOMException('The operation timed out', 'TimeoutError'); }
+                  catch(e){ reason = new Error('Timeout'); }
+                  c.abort(reason);
+                }, ms);
+                return c.signal;
+              };
+            }
+            if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any !== 'function') {
+              AbortSignal.any = function(signals){
+                var c = new AbortController();
+                if (signals) {
+                  Array.prototype.slice.call(signals).forEach(function(sig){
+                    if (!sig) return;
+                    if (sig.aborted) { c.abort(sig.reason); return; }
+                    sig.addEventListener('abort', function(){ c.abort(sig.reason); }, { once: true });
+                  });
+                }
+                return c.signal;
+              };
+            }
+          } catch(e){}
           function post(level, args){
             try {
               var parts = Array.prototype.slice.call(args).map(function(a){
