@@ -8,21 +8,14 @@ func whalePath(scale: CGFloat, cx: CGFloat, cy: CGFloat, ox: CGFloat = 500, oy: 
         NSPoint(x: (x - ox) * scale + cx, y: (y - oy) * scale + cy)
     }
     let p = NSBezierPath()
-    // nose
     p.move(to: pt(850, 480))
-    // forehead -> back -> tail base
     p.curve(to: pt(760, 360), controlPoint1: pt(860, 430), controlPoint2: pt(820, 380))
     p.curve(to: pt(420, 350), controlPoint1: pt(660, 335), controlPoint2: pt(520, 330))
     p.curve(to: pt(260, 440), controlPoint1: pt(350, 365), controlPoint2: pt(295, 415))
-    // upper fluke
     p.curve(to: pt(150, 330), controlPoint1: pt(240, 410), controlPoint2: pt(175, 365))
-    // fluke notch
     p.curve(to: pt(210, 480), controlPoint1: pt(150, 455), controlPoint2: pt(185, 480))
-    // lower fluke
     p.curve(to: pt(150, 610), controlPoint1: pt(185, 510), controlPoint2: pt(150, 560))
-    // tail base (lower)
     p.curve(to: pt(270, 550), controlPoint1: pt(205, 600), controlPoint2: pt(250, 565))
-    // belly back to nose
     p.curve(to: pt(850, 480), controlPoint1: pt(560, 650), controlPoint2: pt(760, 600))
     p.close()
     return p
@@ -47,26 +40,28 @@ let (mainRep, mainCtx) = makeBitmap(S)
 NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = mainCtx
 
-let rect = NSRect(x: 0, y: 0, width: S, height: S)
-let radius: CGFloat = 234
-let bg = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+// Squircle background occupying ~82% of the canvas (like stock macOS icons),
+// leaving a transparent margin so it doesn't look oversized.
+let bgRect = NSRect(x: 100, y: 100, width: 824, height: 824)
+let bgRadius: CGFloat = 185
+let bg = NSBezierPath(roundedRect: bgRect, xRadius: bgRadius, yRadius: bgRadius)
 let top = NSColor(calibratedRed: 0.29, green: 0.45, blue: 1.00, alpha: 1.0)   // #4A73FF
 let bottom = NSColor(calibratedRed: 0.08, green: 0.18, blue: 0.66, alpha: 1.0) // #142EA8
 NSGradient(colors: [top, bottom])!.draw(in: bg, angle: -90)
 
 // subtle inner ring
-let ring = NSBezierPath(ovalIn: NSRect(x: 150, y: 150, width: 724, height: 724))
+let ring = NSBezierPath(ovalIn: NSRect(x: 200, y: 200, width: 624, height: 624))
 NSColor.white.withAlphaComponent(0.06).setStroke()
-ring.lineWidth = 20
+ring.lineWidth = 16
 ring.stroke()
 
-// whale, ~62% width, centered
+// whale, ~52% of the squircle width, centered
 let whale = whalePath(scale: 0.62, cx: 512, cy: 512)
 NSColor.white.setFill()
 whale.fill()
 
 // eye
-let eye = NSBezierPath(ovalIn: NSRect(x: 512 + (720 - 500) * 0.62, y: 512 + (430 - 470) * 0.62, width: 18, height: 18))
+let eye = NSBezierPath(ovalIn: NSRect(x: 512 + (720 - 500) * 0.62, y: 512 + (430 - 470) * 0.62, width: 16, height: 16))
 top.setFill()
 eye.fill()
 
