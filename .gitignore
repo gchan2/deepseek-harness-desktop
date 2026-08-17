@@ -13,3 +13,5 @@ npm-debug.log*
 
 # Local screenshots / scratch
 screenshots/
+menubar.png
+menubar@2x.png
