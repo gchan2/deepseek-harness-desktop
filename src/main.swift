@@ -1,5 +1,4 @@
 import AppKit
-import WebKit
 import Foundation
 import Darwin
 
@@ -8,6 +7,7 @@ import Darwin
 let port: UInt16 = 3080
 let localURL = URL(string: "http://127.0.0.1:\(port)")!
 let appName = "DeepSeek Harness"
+let chromeWindowSize = "960,680"
 
 // MARK: - Helpers
 
@@ -100,7 +100,6 @@ final class ServerController {
         p.executableURL = URL(fileURLWithPath: node)
         p.arguments = [bin, "web"]
 
-        // Writable working dir for any runtime state.
         let fm = FileManager.default
         let support = (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("DeepSeekHarness"))!
@@ -112,8 +111,6 @@ final class ServerController {
         env["HOME"] = NSHomeDirectory()
         env["LANG"] = "en_US.UTF-8"
         env["NO_COLOR"] = "1"
-        // Strip NODE_OPTIONS: some flags (e.g. --use-system-ca) are not allowed via
-        // NODE_OPTIONS on Node 19+ and can break the bundled server.
         env.removeValue(forKey: "NODE_OPTIONS")
         env.removeValue(forKey: "NODE_PATH")
         env.removeValue(forKey: "NODE_EXTRA_CA_CERTS")
@@ -124,22 +121,14 @@ final class ServerController {
         p.standardOutput = outPipe
         p.standardError = errPipe
 
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+        let forward: (FileHandle) -> Void = { [weak self] h in
             let d = h.availableData
             if d.count > 0, let s = String(data: d, encoding: .utf8) {
                 self?.onLog?(s)
             }
         }
-        errPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let d = h.availableData
-            if d.count > 0, let s = String(data: d, encoding: .utf8) {
-                self?.onLog?(s)
-            }
-        }
-
-        p.terminationHandler = { proc in
-            NSLog("DSH: server process terminated status=\(proc.terminationStatus) reason=\(proc.terminationReason.rawValue)")
-        }
+        outPipe.fileHandleForReading.readabilityHandler = forward
+        errPipe.fileHandleForReading.readabilityHandler = forward
 
         do {
             try p.run()
@@ -148,7 +137,6 @@ final class ServerController {
             return true
         } catch {
             NSLog("DSH: Failed to start server: \(error.localizedDescription)")
-            onLog?("Failed to start server: \(error.localizedDescription)")
             return false
         }
     }
@@ -156,7 +144,6 @@ final class ServerController {
     func stop() {
         process?.terminationHandler = nil
         process?.terminate()
-        // Give it a moment, then kill harder.
         DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
             if let p = self?.process, p.isRunning { p.interrupt() }
         }
@@ -166,199 +153,64 @@ final class ServerController {
     deinit { stop() }
 }
 
-// MARK: - App delegate
+// MARK: - App delegate (menu bar app)
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSWindowDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    private var window: NSWindow!
-    private var webView: WKWebView!
     private let server = ServerController()
-    private var statusLabel: NSTextField!
-    private var spinner: NSProgressIndicator!
-    private var loadingContainer: NSView!
-    private var didLoad = false
+    private var statusItem: NSStatusItem!
+    private var didOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        buildMenu()
-        buildWindow()
+        // Menu-bar-only app: no Dock icon, no persistent window.
+        NSApp.setActivationPolicy(.accessory)
+        buildStatusItem()
         launchServer()
-    }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         server.stop()
     }
 
-    // MARK: UI
+    // MARK: Menu bar
 
-    private func buildMenu() {
-        let mainMenu = NSMenu()
-        let appItem = NSMenuItem()
-        mainMenu.addItem(appItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit \(appName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        appItem.submenu = appMenu
-
-        let viewItem = NSMenuItem()
-        mainMenu.addItem(viewItem)
-        let viewMenu = NSMenu(title: "View")
-        viewMenu.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "r")
-        viewMenu.addItem(withTitle: "Open in Browser", action: #selector(openInBrowser), keyEquivalent: "b")
-        viewItem.submenu = viewMenu
-
-        NSApp.mainMenu = mainMenu
+    private func buildStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            button.image = menuBarIcon()
+            button.image?.isTemplate = true
+        }
+        let menu = NSMenu()
+        let openItem = NSMenuItem(title: "打开 DeepSeek Harness", action: #selector(openWebUI), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+        let browserItem = NSMenuItem(title: "在浏览器中打开", action: #selector(openInBrowserAction), keyEquivalent: "")
+        browserItem.target = self
+        menu.addItem(browserItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出并停止服务", action: #selector(quitAction), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        statusItem.menu = menu
     }
 
-    private func buildWindow() {
-        let rect = NSRect(x: 0, y: 0, width: 1200, height: 800)
-        window = NSWindow(contentRect: rect,
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                          backing: .buffered,
-                          defer: false)
-        window.title = appName
-        window.titlebarAppearsTransparent = false
-        window.center()
-        window.minSize = NSSize(width: 720, height: 520)
-        window.delegate = self
-
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
-
-        // Capture front-end console output (console.log/error/warn, window.onerror,
-        // unhandledrejection) so web UI errors are visible in the system log.
-        let ucc = WKUserContentController()
-        let consoleBridge = """
-        (function(){
-          // Polyfill AbortSignal.timeout / AbortSignal.any (Safari 16 / 17.4+);
-          // macOS 12 WKWebView (Safari 15) lacks them and dsh calls them directly.
-          try {
-            if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout !== 'function') {
-              AbortSignal.timeout = function(ms){
-                var c = new AbortController();
-                var t = setTimeout(function(){
-                  var reason;
-                  try { reason = new DOMException('The operation timed out', 'TimeoutError'); }
-                  catch(e){ reason = new Error('Timeout'); }
-                  c.abort(reason);
-                }, ms);
-                return c.signal;
-              };
-            }
-            if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any !== 'function') {
-              AbortSignal.any = function(signals){
-                var c = new AbortController();
-                if (signals) {
-                  Array.prototype.slice.call(signals).forEach(function(sig){
-                    if (!sig) return;
-                    if (sig.aborted) { c.abort(sig.reason); return; }
-                    sig.addEventListener('abort', function(){ c.abort(sig.reason); }, { once: true });
-                  });
-                }
-                return c.signal;
-              };
-            }
-          } catch(e){}
-          function post(level, args){
-            try {
-              var parts = Array.prototype.slice.call(args).map(function(a){
-                if (a instanceof Error) return a.name + ': ' + a.message;
-                if (typeof a === 'object') { try { return JSON.stringify(a); } catch(e){ return String(a); } }
-                return String(a);
-              });
-              window.webkit.messageHandlers.console.postMessage({level: level, msg: parts.join(' ')});
-            } catch(e){}
-          }
-          ['log','error','warn','info','debug'].forEach(function(l){
-            var orig = console[l];
-            console[l] = function(){ post(l, arguments); if (orig) orig.apply(console, arguments); };
-          });
-          window.addEventListener('error', function(e){
-            post('error', ['[window.onerror]', e.message, (e.filename||'')+':'+(e.lineno||'')]);
-          });
-          window.addEventListener('unhandledrejection', function(e){
-            post('error', ['[unhandledrejection]', (e.reason && e.reason.message) || e.reason]);
-          });
-          // Instrument WebSocket lifecycle for diagnostics
-          try {
-            var OrigWS = window.WebSocket;
-            if (OrigWS) {
-              window.WebSocket = function(url, protocols){
-                var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
-                try {
-                  ws.addEventListener('open', function(){ post('log', ['[ws] open', String(url)]); });
-                  ws.addEventListener('error', function(){ post('error', ['[ws] ERROR', String(url)]); });
-                  ws.addEventListener('close', function(e){ post('warn', ['[ws] close', String(url), 'code='+e.code, 'clean='+e.wasClean]); });
-                } catch(e){}
-                return ws;
-              };
-              window.WebSocket.prototype = OrigWS.prototype;
-            }
-          } catch(e){}
-          // Instrument failed fetches
-          try {
-            var origFetch = window.fetch;
-            if (origFetch) {
-              window.fetch = function(){
-                var url = arguments[0];
-                return origFetch.apply(this, arguments).then(function(res){
-                  if (!res.ok) post('error', ['[fetch] HTTP '+res.status, String(url)]);
-                  return res;
-                }).catch(function(err){
-                  post('error', ['[fetch] FAIL', String(url), (err && err.message) || err]);
-                  throw err;
-                });
-              };
-            }
-          } catch(e){}
-        })();
-        """
-        let script = WKUserScript(source: consoleBridge, injectionTime: .atDocumentStart, forMainFrameOnly: false)
-        ucc.addUserScript(script)
-        ucc.add(self, name: "console")
-        config.userContentController = ucc
-
-        webView = WKWebView(frame: rect, configuration: config)
-        webView.navigationDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-
-        // Loading overlay
-        loadingContainer = NSView(frame: rect)
-        loadingContainer.autoresizingMask = [.width, .height]
-        loadingContainer.wantsLayer = true
-        loadingContainer.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-
-        spinner = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 32, height: 32))
-        spinner.style = .spinning
-        spinner.isDisplayedWhenStopped = false
-        spinner.sizeToFit()
-        spinner.startAnimation(nil)
-
-        statusLabel = NSTextField(labelWithString: "Starting DeepSeek Harness…")
-        statusLabel.alignment = .center
-        statusLabel.font = NSFont.systemFont(ofSize: 14)
-        statusLabel.textColor = .secondaryLabelColor
-
-        let stack = NSStackView(views: [spinner, statusLabel])
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 16
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        loadingContainer.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.centerXAnchor.constraint(equalTo: loadingContainer.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: loadingContainer.centerYAnchor)
-        ])
-
-        window.contentView = webView
-        webView.addSubview(loadingContainer)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    private func menuBarIcon() -> NSImage {
+        // Draw the whale directly (template) so the menu-bar item is always visible.
+        let img = NSImage(size: NSSize(width: 18, height: 18))
+        img.lockFocus()
+        NSColor.black.setFill()
+        let w = NSBezierPath()
+        // body (ellipse) + tail fluke + belly, scaled into 18x18
+        w.appendOval(in: NSRect(x: 8.5, y: 6, width: 7.5, height: 6))
+        w.move(to: NSPoint(x: 8.5, y: 9))
+        w.line(to: NSPoint(x: 3, y: 12))
+        w.line(to: NSPoint(x: 4.5, y: 9))
+        w.line(to: NSPoint(x: 3, y: 6))
+        w.close()
+        w.fill()
+        img.unlockFocus()
+        img.isTemplate = true
+        return img
     }
 
     // MARK: Server launch
@@ -366,12 +218,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func launchServer() {
         NSLog("DSH: launchServer: finding node")
         guard let node = findNode() else {
-            showError("Node.js 未找到或版本低于 20.12，请先安装 Node.js 20.12+（https://nodejs.org）后重试。")
+            notifyError("Node.js 未找到或版本低于 20.12，请先安装 Node.js 20.12+（https://nodejs.org）")
             return
         }
         NSLog("DSH: launchServer: node=\(node)")
         guard let bin = bundledDSHBin() else {
-            showError("未找到内置的 DeepSeek Harness 程序，请重新安装本应用。")
+            notifyError("未找到内置的 DeepSeek Harness 程序，请重新安装本应用。")
             return
         }
         NSLog("DSH: launchServer: bin=\(bin)")
@@ -394,50 +246,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 Thread.sleep(forTimeInterval: 0.5)
             }
             DispatchQueue.main.async {
-                self?.showError("启动超时：本地服务未在 3080 端口响应。请检查 Node.js 环境或网络。")
+                self?.notifyError("启动超时：本地服务未在 3080 端口响应。")
             }
         }
     }
 
     private func finishLoading() {
-        guard !didLoad else { return }
-        didLoad = true
-        loadingContainer.isHidden = true
-        // Open the web UI in a Chrome app-mode window (borderless, no address bar)
-        // so it looks like a native app. Chrome's Chromium engine supports the
-        // regex lookbehind that macOS 12's WKWebView lacks.
+        guard !didOpen else { return }
+        didOpen = true
         openWebUI()
-        let html = """
-        <html><head><meta charset="utf-8"><style>
-          body { font-family:-apple-system; display:flex; align-items:center; justify-content:center; height:100%; margin:0; background:#f5f5f7; }
-          .box { text-align:center; color:#1d1d1f; max-width:520px; padding:24px; }
-          h1 { font-size:22px; margin-bottom:12px; }
-          p { color:#555; line-height:1.6; }
-          .url { font-family:ui-monospace,monospace; font-size:13px; color:#888; }
-          a.btn { display:inline-block; margin:8px 4px; padding:10px 18px; border-radius:8px; background:#4A73FF; color:#fff; text-decoration:none; font-weight:600; }
-          a.btn.ghost { background:#e5e5ea; color:#1d1d1f; }
-        </style></head><body>
-        <div class="box">
-          <h1>已在独立窗口打开</h1>
-          <p>DeepSeek Harness 已在 Chrome 独立窗口中打开<br><span class="url">http://127.0.0.1:3080</span></p>
-          <p>本窗口负责在后台运行服务。<br><strong>关闭窗口或退出 App 会同时停止服务。</strong></p>
-          <p>
-            <a class="btn" href="http://127.0.0.1:3080">重新打开</a>
-            <a class="btn ghost" href="app://quit">退出并停止服务</a>
-          </p>
-        </div></body></html>
-        """
-        webView.loadHTMLString(html, baseURL: nil)
     }
 
-    private func openWebUI() {
+    private func notifyError(_ message: String) {
+        NSLog("DSH: %@", message)
+        let alert = NSAlert()
+        alert.messageText = appName
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
+    // MARK: Actions
+
+    @objc private func openWebUI() {
         // Prefer Chrome app-mode (borderless standalone window); fall back to
         // the system default browser.
         let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         if FileManager.default.isExecutableFile(atPath: chrome) {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: chrome)
-            p.arguments = ["--app=\(localURL.absoluteString)", "--new-window"]
+            p.arguments = ["--app=\(localURL.absoluteString)", "--window-size=\(chromeWindowSize)", "--new-window"]
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
             do {
@@ -450,73 +288,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NSWorkspace.shared.open(localURL)
     }
 
-    private func showError(_ message: String) {
-        statusLabel.stringValue = message
-        statusLabel.textColor = .systemRed
-        spinner.stopAnimation(nil)
-        let html = """
-        <html><body style="font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100%;margin:0;background:#f5f5f7">
-        <div style="text-align:center;color:#1d1d1f;max-width:480px">
-        <h2>\(appName)</h2><p style="color:#555">\(message)</p>
-        <p><a href="https://nodejs.org">Install Node.js</a> · <a href="https://github.com/deepseek-ai/deepseek-harness">Project on GitHub</a></p>
-        </div></body></html>
-        """
-        webView.loadHTMLString(html, baseURL: nil)
+    @objc private func openInBrowserAction() {
+        NSWorkspace.shared.open(localURL)
     }
 
-    // MARK: Actions
-
-    @objc private func reload() {
-        webView.reload()
-    }
-
-    @objc private func openInBrowser() {
-        openWebUI()
-    }
-
-    // MARK: WKNavigationDelegate
-
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
-                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        guard let url = navigationAction.request.url else {
-            decisionHandler(.cancel); return
-        }
-        if url.scheme == "app" {
-            if url.host == "quit" {
-                NSApp.terminate(nil)
-            }
-            decisionHandler(.cancel); return
-        }
-        // Keep everything on the local server inside the app; external links open in the browser.
-        if url.host == "127.0.0.1" || url.host == "localhost" {
-            decisionHandler(.allow)
-        } else if navigationAction.navigationType == .linkActivated {
-            NSWorkspace.shared.open(url)
-            decisionHandler(.cancel)
-        } else {
-            decisionHandler(.allow)
-        }
-    }
-
-    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        // Hide the overlay once real content starts loading.
-        if didLoad {
-            loadingContainer.isHidden = true
-        }
-    }
-
-    // MARK: WKScriptMessageHandler — forward front-end console logs to the system log
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "console" else { return }
-        if let body = message.body as? [String: Any] {
-            let level = body["level"] as? String ?? "log"
-            let msg = body["msg"] as? String ?? ""
-            if msg.count > 800 {
-                NSLog("DSH-WEB[%@] %@…", level, String(msg.prefix(800)))
-            } else {
-                NSLog("DSH-WEB[%@] %@", level, msg)
-            }
-        }
+    @objc private func quitAction() {
+        NSApp.terminate(nil)
     }
 }
 

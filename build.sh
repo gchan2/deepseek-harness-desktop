@@ -27,13 +27,11 @@ fi
 echo "==> Compiling Swift launcher"
 swiftc -O -framework AppKit -framework WebKit src/main.swift -o "$STAGE/Contents/MacOS/$APP_NAME"
 
-# 2. Render the app icon (if not present) and build the .icns
-if [[ ! -f "$ICON_MASTER" ]]; then
-  echo "==> Rendering app icon"
-  mkdir -p "$ROOT/build"
-  swiftc -O src/makeicon.swift -o "$ROOT/build/makeicon"
-  "$ROOT/build/makeicon" "$ICON_MASTER"
-fi
+# 2. Render the app icon + menu bar icon, then build the .icns
+echo "==> Rendering icons"
+mkdir -p "$ROOT/build"
+swiftc -O src/makeicon.swift -o "$ROOT/build/makeicon"
+( cd "$ROOT" && "$ROOT/build/makeicon" "$ICON_MASTER" )
 
 echo "==> Building icon.icns"
 ICONSET="$STAGE/build.iconset"
@@ -49,6 +47,8 @@ sips -z 512 512   "$ICON_MASTER" --out "$ICONSET/icon_512x512.png"   >/dev/null
 cp "$ICON_MASTER" "$ICONSET/icon_512x512@2x.png"
 iconutil -c icns "$ICONSET" -o "$STAGE/Contents/Resources/icon.icns"
 rm -rf "$ICONSET"
+cp "$ROOT/menubar.png" "$STAGE/Contents/Resources/menubar.png"
+cp "$ROOT/menubar@2x.png" "$STAGE/Contents/Resources/menubar@2x.png"
 
 # 3. Bundle dsh runtime into Resources
 echo "==> Bundling dsh node_modules"
