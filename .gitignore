@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+*.icloud
+
+# Build artifacts
+build/
+dist/
+*.app
+
+# Node (dsh runtime is fetched at build time via npm install)
+dsh/node_modules/
+npm-debug.log*
+
+# Local screenshots / scratch
+screenshots/

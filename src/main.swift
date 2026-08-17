@@ -1,0 +1,371 @@
+import AppKit
+import WebKit
+import Foundation
+import Darwin
+
+// MARK: - Constants
+
+let port: UInt16 = 3080
+let localURL = URL(string: "http://127.0.0.1:\(port)")!
+let appName = "DeepSeek Harness"
+
+// MARK: - Helpers
+
+func fileExists(_ path: String) -> Bool {
+    return FileManager.default.fileExists(atPath: path)
+}
+
+func isExecutable(_ path: String) -> Bool {
+    return FileManager.default.isExecutableFile(atPath: path)
+}
+
+/// Find a usable node binary. Requires Node >= 20.12 (needed for util.parseEnv).
+func findNode() -> String? {
+    let candidates = [
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/bin/node",
+        "/Users/gchen/.workbuddy/binaries/node/versions/22.22.2/bin/node",
+        "/Users/gchen/.workbuddy/binaries/node/versions/22.23.1/bin/node",
+        "/Users/gchen/.local/bin/node",
+        "/usr/local/bin/node22",
+        "/opt/homebrew/bin/node22"
+    ]
+    for c in candidates where fileExists(c) && isExecutable(c) {
+        if nodeVersion(at: c) >= (20, 12) { return c }
+    }
+    return nil
+}
+
+/// Runs `node -p process.versions.node` and parses the major.minor.
+func nodeVersion(at path: String) -> (Int, Int) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = ["-p", "process.versions.node"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do {
+        try p.run()
+        p.waitUntilExit()
+        let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let parts = s.split(separator: ".")
+        if parts.count >= 2, let major = Int(parts[0]), let minor = Int(parts[1]) {
+            return (major, minor)
+        }
+    } catch {}
+    return (0, 0)
+}
+
+/// Locate the bundled dsh wrapper. The wrapper installs signal-ignore
+/// handlers and then dynamically imports the real dsh entry script.
+func bundledDSHBin() -> String? {
+    guard let res = Bundle.main.resourceURL else { return nil }
+    let p = res.appendingPathComponent("dsh/bin-wrapper.mjs").path
+    return fileExists(p) ? p : nil
+}
+
+// MARK: - Socket helper (port readiness)
+
+func portOpen(host: String, port: UInt16) -> Bool {
+    let sock = socket(AF_INET, SOCK_STREAM, 0)
+    if sock < 0 { return false }
+    defer { close(sock) }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = port.bigEndian
+    addr.sin_addr.s_addr = inet_addr(host)
+    var sa = sockaddr()
+    withUnsafePointer(to: &addr) { a in
+        a.withMemoryRebound(to: sockaddr.self, capacity: 1) { reb in
+            sa = reb.pointee
+        }
+    }
+    let r = withUnsafePointer(to: &sa) { p in
+        connect(sock, p, socklen_t(MemoryLayout<sockaddr_in>.size))
+    }
+    return r == 0
+}
+
+// MARK: - Server process management
+
+final class ServerController {
+    private var process: Process?
+    var onLog: ((String) -> Void)?
+
+    func start(node: String, bin: String) -> Bool {
+        stop()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: node)
+        p.arguments = [bin, "web"]
+
+        // Writable working dir for any runtime state.
+        let fm = FileManager.default
+        let support = (fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("DeepSeekHarness"))!
+        try? fm.createDirectory(at: support, withIntermediateDirectories: true, attributes: nil)
+        p.currentDirectoryURL = support
+
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        env["HOME"] = NSHomeDirectory()
+        env["LANG"] = "en_US.UTF-8"
+        env["NO_COLOR"] = "1"
+        // Strip NODE_OPTIONS: some flags (e.g. --use-system-ca) are not allowed via
+        // NODE_OPTIONS on Node 19+ and can break the bundled server.
+        env.removeValue(forKey: "NODE_OPTIONS")
+        env.removeValue(forKey: "NODE_PATH")
+        env.removeValue(forKey: "NODE_EXTRA_CA_CERTS")
+        p.environment = env
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = errPipe
+
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.count > 0, let s = String(data: d, encoding: .utf8) {
+                self?.onLog?(s)
+            }
+        }
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.count > 0, let s = String(data: d, encoding: .utf8) {
+                self?.onLog?(s)
+            }
+        }
+
+        p.terminationHandler = { proc in
+            NSLog("DSH: server process terminated status=\(proc.terminationStatus) reason=\(proc.terminationReason.rawValue)")
+        }
+
+        do {
+            try p.run()
+            process = p
+            NSLog("DSH: server process started pid=\(p.processIdentifier)")
+            return true
+        } catch {
+            NSLog("DSH: Failed to start server: \(error.localizedDescription)")
+            onLog?("Failed to start server: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    func stop() {
+        process?.terminationHandler = nil
+        process?.terminate()
+        // Give it a moment, then kill harder.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            if let p = self?.process, p.isRunning { p.interrupt() }
+        }
+        process = nil
+    }
+
+    deinit { stop() }
+}
+
+// MARK: - App delegate
+
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSWindowDelegate {
+
+    private var window: NSWindow!
+    private var webView: WKWebView!
+    private let server = ServerController()
+    private var statusLabel: NSTextField!
+    private var spinner: NSProgressIndicator!
+    private var loadingContainer: NSView!
+    private var didLoad = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        buildMenu()
+        buildWindow()
+        launchServer()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        server.stop()
+    }
+
+    // MARK: UI
+
+    private func buildMenu() {
+        let mainMenu = NSMenu()
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit \(appName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        viewMenu.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "r")
+        viewMenu.addItem(withTitle: "Open in Browser", action: #selector(openInBrowser), keyEquivalent: "b")
+        viewItem.submenu = viewMenu
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func buildWindow() {
+        let rect = NSRect(x: 0, y: 0, width: 1200, height: 800)
+        window = NSWindow(contentRect: rect,
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                          backing: .buffered,
+                          defer: false)
+        window.title = appName
+        window.titlebarAppearsTransparent = false
+        window.center()
+        window.minSize = NSSize(width: 720, height: 520)
+        window.delegate = self
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        webView = WKWebView(frame: rect, configuration: config)
+        webView.navigationDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+
+        // Loading overlay
+        loadingContainer = NSView(frame: rect)
+        loadingContainer.autoresizingMask = [.width, .height]
+        loadingContainer.wantsLayer = true
+        loadingContainer.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        spinner = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 32, height: 32))
+        spinner.style = .spinning
+        spinner.isDisplayedWhenStopped = false
+        spinner.sizeToFit()
+        spinner.startAnimation(nil)
+
+        statusLabel = NSTextField(labelWithString: "Starting DeepSeek Harness…")
+        statusLabel.alignment = .center
+        statusLabel.font = NSFont.systemFont(ofSize: 14)
+        statusLabel.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [spinner, statusLabel])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 16
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        loadingContainer.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: loadingContainer.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: loadingContainer.centerYAnchor)
+        ])
+
+        window.contentView = webView
+        webView.addSubview(loadingContainer)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: Server launch
+
+    private func launchServer() {
+        NSLog("DSH: launchServer: finding node")
+        guard let node = findNode() else {
+            showError("Node.js 未找到或版本低于 20.12，请先安装 Node.js 20.12+（https://nodejs.org）后重试。")
+            return
+        }
+        NSLog("DSH: launchServer: node=\(node)")
+        guard let bin = bundledDSHBin() else {
+            showError("未找到内置的 DeepSeek Harness 程序，请重新安装本应用。")
+            return
+        }
+        NSLog("DSH: launchServer: bin=\(bin)")
+
+        server.onLog = { [weak self] line in
+            NSLog("DSH: [dsh] %@", line.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        let ok = server.start(node: node, bin: bin)
+        NSLog("DSH: launchServer: start returned \(ok)")
+        if !ok { return }
+
+        let deadline = Date().addingTimeInterval(120)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            while Date() < deadline {
+                if portOpen(host: "127.0.0.1", port: port) {
+                    DispatchQueue.main.async { self?.finishLoading() }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            DispatchQueue.main.async {
+                self?.showError("启动超时：本地服务未在 3080 端口响应。请检查 Node.js 环境或网络。")
+            }
+        }
+    }
+
+    private func finishLoading() {
+        guard !didLoad else { return }
+        didLoad = true
+        statusLabel.stringValue = "Connecting…"
+        let req = URLRequest(url: localURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        webView.load(req)
+    }
+
+    private func showError(_ message: String) {
+        statusLabel.stringValue = message
+        statusLabel.textColor = .systemRed
+        spinner.stopAnimation(nil)
+        let html = """
+        <html><body style="font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100%;margin:0;background:#f5f5f7">
+        <div style="text-align:center;color:#1d1d1f;max-width:480px">
+        <h2>\(appName)</h2><p style="color:#555">\(message)</p>
+        <p><a href="https://nodejs.org">Install Node.js</a> · <a href="https://github.com/deepseek-ai/deepseek-harness">Project on GitHub</a></p>
+        </div></body></html>
+        """
+        webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    // MARK: Actions
+
+    @objc private func reload() {
+        webView.reload()
+    }
+
+    @objc private func openInBrowser() {
+        NSWorkspace.shared.open(localURL)
+    }
+
+    // MARK: WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel); return
+        }
+        // Keep everything on the local server inside the app; external links open in the browser.
+        if url.host == "127.0.0.1" || url.host == "localhost" {
+            decisionHandler(.allow)
+        } else if navigationAction.navigationType == .linkActivated {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+        } else {
+            decisionHandler(.allow)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        // Hide the overlay once real content starts loading.
+        if didLoad {
+            loadingContainer.isHidden = true
+        }
+    }
+}
+
+// MARK: - Entry point
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
