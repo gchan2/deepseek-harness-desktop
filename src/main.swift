@@ -403,9 +403,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         guard !didLoad else { return }
         didLoad = true
         loadingContainer.isHidden = true
-        // Open the web UI in the system default browser (macOS 12 WKWebView
-        // lacks regex lookbehind, so the dsh front-end cannot render there).
-        NSWorkspace.shared.open(localURL)
+        // Open the web UI in a Chrome app-mode window (borderless, no address bar)
+        // so it looks like a native app. Chrome's Chromium engine supports the
+        // regex lookbehind that macOS 12's WKWebView lacks.
+        openWebUI()
         let html = """
         <html><head><meta charset="utf-8"><style>
           body { font-family:-apple-system; display:flex; align-items:center; justify-content:center; height:100%; margin:0; background:#f5f5f7; }
@@ -417,16 +418,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
           a.btn.ghost { background:#e5e5ea; color:#1d1d1f; }
         </style></head><body>
         <div class="box">
-          <h1>已在浏览器中打开</h1>
-          <p>DeepSeek Harness 已在默认浏览器打开<br><span class="url">http://127.0.0.1:3080</span></p>
+          <h1>已在独立窗口打开</h1>
+          <p>DeepSeek Harness 已在 Chrome 独立窗口中打开<br><span class="url">http://127.0.0.1:3080</span></p>
           <p>本窗口负责在后台运行服务。<br><strong>关闭窗口或退出 App 会同时停止服务。</strong></p>
           <p>
-            <a class="btn" href="http://127.0.0.1:3080">重新在浏览器打开</a>
+            <a class="btn" href="http://127.0.0.1:3080">重新打开</a>
             <a class="btn ghost" href="app://quit">退出并停止服务</a>
           </p>
         </div></body></html>
         """
         webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    private func openWebUI() {
+        // Prefer Chrome app-mode (borderless standalone window); fall back to
+        // the system default browser.
+        let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if FileManager.default.isExecutableFile(atPath: chrome) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: chrome)
+            p.arguments = ["--app=\(localURL.absoluteString)", "--new-window"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            do {
+                try p.run()
+                return
+            } catch {
+                NSLog("DSH: chrome app-mode failed: \(error.localizedDescription)")
+            }
+        }
+        NSWorkspace.shared.open(localURL)
     }
 
     private func showError(_ message: String) {
@@ -450,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     @objc private func openInBrowser() {
-        NSWorkspace.shared.open(localURL)
+        openWebUI()
     }
 
     // MARK: WKNavigationDelegate
