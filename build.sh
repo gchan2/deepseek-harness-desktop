@@ -93,6 +93,8 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
   <dict>
     <key>NSAllowsLocalNetworking</key>
     <true/>
+    <key>NSAllowsArbitraryLoadsInWebContent</key>
+    <true/>
   </dict>
   <key>CFBundleDocumentTypes</key>
   <array/>

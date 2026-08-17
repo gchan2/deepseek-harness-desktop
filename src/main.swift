@@ -168,7 +168,7 @@ final class ServerController {
 
 // MARK: - App delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSWindowDelegate, WKScriptMessageHandler {
 
     private var window: NSWindow!
     private var webView: WKWebView!
@@ -229,6 +229,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
+
+        // Capture front-end console output (console.log/error/warn, window.onerror,
+        // unhandledrejection) so web UI errors are visible in the system log.
+        let ucc = WKUserContentController()
+        let consoleBridge = """
+        (function(){
+          function post(level, args){
+            try {
+              var parts = Array.prototype.slice.call(args).map(function(a){
+                if (a instanceof Error) return a.name + ': ' + a.message;
+                if (typeof a === 'object') { try { return JSON.stringify(a); } catch(e){ return String(a); } }
+                return String(a);
+              });
+              window.webkit.messageHandlers.console.postMessage({level: level, msg: parts.join(' ')});
+            } catch(e){}
+          }
+          ['log','error','warn','info','debug'].forEach(function(l){
+            var orig = console[l];
+            console[l] = function(){ post(l, arguments); if (orig) orig.apply(console, arguments); };
+          });
+          window.addEventListener('error', function(e){
+            post('error', ['[window.onerror]', e.message, (e.filename||'')+':'+(e.lineno||'')]);
+          });
+          window.addEventListener('unhandledrejection', function(e){
+            post('error', ['[unhandledrejection]', (e.reason && e.reason.message) || e.reason]);
+          });
+          // Instrument WebSocket lifecycle for diagnostics
+          try {
+            var OrigWS = window.WebSocket;
+            if (OrigWS) {
+              window.WebSocket = function(url, protocols){
+                var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+                try {
+                  ws.addEventListener('open', function(){ post('log', ['[ws] open', String(url)]); });
+                  ws.addEventListener('error', function(){ post('error', ['[ws] ERROR', String(url)]); });
+                  ws.addEventListener('close', function(e){ post('warn', ['[ws] close', String(url), 'code='+e.code, 'clean='+e.wasClean]); });
+                } catch(e){}
+                return ws;
+              };
+              window.WebSocket.prototype = OrigWS.prototype;
+            }
+          } catch(e){}
+          // Instrument failed fetches
+          try {
+            var origFetch = window.fetch;
+            if (origFetch) {
+              window.fetch = function(){
+                var url = arguments[0];
+                return origFetch.apply(this, arguments).then(function(res){
+                  if (!res.ok) post('error', ['[fetch] HTTP '+res.status, String(url)]);
+                  return res;
+                }).catch(function(err){
+                  post('error', ['[fetch] FAIL', String(url), (err && err.message) || err]);
+                  throw err;
+                });
+              };
+            }
+          } catch(e){}
+        })();
+        """
+        let script = WKUserScript(source: consoleBridge, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        ucc.addUserScript(script)
+        ucc.add(self, name: "console")
+        config.userContentController = ucc
+
         webView = WKWebView(frame: rect, configuration: config)
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = true
@@ -359,6 +424,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // Hide the overlay once real content starts loading.
         if didLoad {
             loadingContainer.isHidden = true
+        }
+    }
+
+    // MARK: WKScriptMessageHandler — forward front-end console logs to the system log
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "console" else { return }
+        if let body = message.body as? [String: Any] {
+            let level = body["level"] as? String ?? "log"
+            let msg = body["msg"] as? String ?? ""
+            if msg.count > 800 {
+                NSLog("DSH-WEB[%@] %@…", level, String(msg.prefix(800)))
+            } else {
+                NSLog("DSH-WEB[%@] %@", level, msg)
+            }
         }
     }
 }
